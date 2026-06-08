@@ -35,6 +35,16 @@ from typing import Any, Mapping
 
 
 FILTER_MAP_DEFAULT = "u:u,g:g,r:r,i:i,z:z,ps1_g:g,ps1_r:r,ps1_i:i,ps1_z:z,ps1_y:z,zg:g,zr:r,zi:i"
+PS1_REFERENCE_BANDS = {"g", "r", "i", "z", "y"}
+PS1_SDSS_GI_COEFFS = {
+    # Tonry et al. 2012 stellar transformations, evaluated as
+    # m_PS1 - m_SDSS = c0 + c1*(g-i) + c2*(g-i)^2 + c3*(g-i)^3.
+    "g": (-0.013, -0.145, 0.019, 0.013),
+    "r": (-0.001, -0.014, 0.001, -0.001),
+    "i": (0.004, -0.014, 0.014, -0.001),
+    "z": (0.013, -0.039, 0.012, -0.001),
+    "y": (0.015, -0.036, 0.012, -0.004),
+}
 
 
 @dataclass
@@ -112,6 +122,12 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument("--ref-filter-map", default=FILTER_MAP_DEFAULT)
     parser.add_argument("--ref-mag-prefix", default="", help="Optional prefix for reference magnitude columns.")
+    parser.add_argument(
+        "--reference-system",
+        choices=["native", "ps1"],
+        default="native",
+        help="Reference magnitude system. 'ps1' transforms SDSS grizy reference columns to PS1; u remains native SDSS.",
+    )
     parser.add_argument("--color", default="g-r", help="Reference color as MAG1-MAG2. Default: g-r.")
     parser.add_argument("--mag-column", default="mag_inst")
     parser.add_argument("--mag-err-column", default="mag_err")
@@ -132,7 +148,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--student-t-df", type=float, default=5.0)
     parser.add_argument("--hide-progress", action="store_true")
 
-    parser.add_argument("--prior-survey-filter-sigma", type=float, default=0.2)
+    parser.add_argument("--prior-survey-filter-sigma", type=float, default=20.0)
     parser.add_argument("--prior-night-sigma", type=float, default=0.05)
     parser.add_argument("--prior-image-sigma", type=float, default=0.05)
     parser.add_argument("--prior-ccd-sigma", type=float, default=0.03)
@@ -192,6 +208,36 @@ def parse_float(value: str | None) -> float | None:
 
 def prefixed(prefix: str, column: str) -> str:
     return column if column.startswith(prefix) else f"{prefix}{column}"
+
+
+def ps1_from_sdss(star: ReferenceStar, band: str, prefix: str) -> float | None:
+    sdss_mag = star.values.get(prefixed(prefix, band))
+    sdss_g = star.values.get(prefixed(prefix, "g"))
+    sdss_i = star.values.get(prefixed(prefix, "i"))
+    if sdss_mag is None or sdss_g is None or sdss_i is None:
+        return None
+    color = sdss_g - sdss_i
+    coeffs = PS1_SDSS_GI_COEFFS.get(band)
+    if coeffs is None:
+        return None
+    c0, c1, c2, c3 = coeffs
+    return sdss_mag + c0 + c1 * color + c2 * color**2 + c3 * color**3
+
+
+def reference_mag(
+    star: ReferenceStar,
+    column: str,
+    *,
+    prefix: str,
+    reference_system: str,
+) -> float | None:
+    if reference_system == "ps1" and column in PS1_REFERENCE_BANDS:
+        return ps1_from_sdss(star, column, prefix)
+    return star.values.get(prefixed(prefix, column))
+
+
+def reference_mag_err(star: ReferenceStar, column: str, *, prefix: str) -> float:
+    return star.values.get(f"{prefixed(prefix, column)}_err", 0.0)
 
 
 def read_reference(path: Path, *, star_id_column: str) -> dict[str, ReferenceStar]:
@@ -281,11 +327,16 @@ def read_measurements(reference: dict[str, ReferenceStar], args: argparse.Namesp
                 continue
 
             filter_name = (row.get(args.filter_column) or "").strip()
-            ref_column = prefixed(args.ref_mag_prefix, filter_map.get(filter_name, filter_name))
-            ref_mag = ref_star.values.get(ref_column)
+            ref_column = filter_map.get(filter_name, filter_name)
+            ref_mag = reference_mag(
+                ref_star,
+                ref_column,
+                prefix=args.ref_mag_prefix,
+                reference_system=args.reference_system,
+            )
             if ref_mag is None:
                 continue
-            ref_mag_err = ref_star.values.get(f"{ref_column}_err", 0.0)
+            ref_mag_err = reference_mag_err(ref_star, ref_column, prefix=args.ref_mag_prefix)
             if args.max_ref_mag_err is not None and ref_mag_err > args.max_ref_mag_err:
                 continue
 
@@ -296,8 +347,18 @@ def read_measurements(reference: dict[str, ReferenceStar], args: argparse.Namesp
             if mag_err <= 0 or mag_err > args.max_mag_err:
                 continue
 
-            left = ref_star.values.get(prefixed(args.ref_mag_prefix, color_left))
-            right = ref_star.values.get(prefixed(args.ref_mag_prefix, color_right))
+            left = reference_mag(
+                ref_star,
+                color_left,
+                prefix=args.ref_mag_prefix,
+                reference_system=args.reference_system,
+            )
+            right = reference_mag(
+                ref_star,
+                color_right,
+                prefix=args.ref_mag_prefix,
+                reference_system=args.reference_system,
+            )
             if left is None or right is None:
                 continue
 

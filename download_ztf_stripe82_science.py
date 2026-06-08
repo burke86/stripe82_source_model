@@ -25,6 +25,7 @@ import os
 import sys
 import time
 from dataclasses import dataclass
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Iterable
 from urllib.error import HTTPError, URLError
@@ -394,6 +395,12 @@ def parse_args() -> argparse.Namespace:
         help="Number of attempts per file. Default: 4.",
     )
     parser.add_argument(
+        "--workers",
+        type=int,
+        default=1,
+        help="Parallel download workers. Default: 1.",
+    )
+    parser.add_argument(
         "--irsa-user",
         default=os.environ.get("IRSA_USER"),
         help="Optional IRSA username for proprietary data. Defaults to IRSA_USER.",
@@ -422,6 +429,9 @@ def main() -> int:
     if args.max_files is not None and args.max_files < 1:
         print("--max-files must be greater than zero", file=sys.stderr)
         return 2
+    if args.workers < 1:
+        print("--workers must be greater than zero", file=sys.stderr)
+        return 2
 
     try:
         authorization = auth_header(args.irsa_user, args.irsa_password)
@@ -432,6 +442,7 @@ def main() -> int:
     seen: set[str] = set()
     total = 0
     manifest_rows: list[dict[str, str]] = []
+    download_jobs: list[tuple[str, Path]] = []
 
     for region in args.regions:
         print(
@@ -478,7 +489,7 @@ def main() -> int:
 
                 if args.dry_run:
                     print(f"would download: {url} -> {destination}")
-                else:
+                elif args.workers == 1:
                     download_file(
                         url,
                         destination,
@@ -487,15 +498,43 @@ def main() -> int:
                         clobber=args.clobber,
                         authorization=authorization,
                     )
+                else:
+                    download_jobs.append((url, destination))
 
                 if args.max_files is not None and total >= args.max_files:
                     append_manifest(args.manifest, manifest_rows)
+                    if download_jobs:
+                        run_parallel_downloads(download_jobs, args, authorization)
                     print(f"matched {total} ZTF products")
                     return 0
 
     append_manifest(args.manifest, manifest_rows)
+    if download_jobs:
+        run_parallel_downloads(download_jobs, args, authorization)
     print(f"matched {total} ZTF products")
     return 0
+
+
+def run_parallel_downloads(jobs: list[tuple[str, Path]], args: argparse.Namespace, authorization: str | None) -> None:
+    print(f"downloading {len(jobs)} ZTF products with {args.workers} workers")
+
+    def _download(job: tuple[str, Path]) -> str:
+        url, destination = job
+        download_file(
+            url,
+            destination,
+            timeout=args.timeout,
+            retries=args.retries,
+            clobber=args.clobber,
+            authorization=authorization,
+        )
+        return str(destination)
+
+    with ThreadPoolExecutor(max_workers=args.workers) as executor:
+        futures = [executor.submit(_download, job) for job in jobs]
+        for index, future in enumerate(as_completed(futures), start=1):
+            destination = future.result()
+            print(f"[{index}/{len(futures)}] ready: {destination}")
 
 
 if __name__ == "__main__":
